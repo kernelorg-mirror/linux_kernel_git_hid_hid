@@ -708,6 +708,7 @@ void hiddev_free(struct kref *ref)
 
 	hid_close_report(hid);
 	kfree(hid->dev_rdesc);
+	kfree(hid->bpf_rdesc);
 	kfree(hid);
 }
 
@@ -1221,13 +1222,12 @@ int hid_open_report(struct hid_device *device)
 	if (WARN_ON(device->status & HID_STAT_PARSED))
 		return -EBUSY;
 
-	start = device->dev_rdesc;
+	start = device->bpf_rdesc ? device->bpf_rdesc : device->dev_rdesc;
+	size = device->bpf_rsize;
 	if (WARN_ON(!start))
 		return -ENODEV;
-	size = device->dev_rsize;
 
-	/* call_hid_bpf_rdesc_fixup() ensures we work on a copy of rdesc */
-	buf = call_hid_bpf_rdesc_fixup(device, start, &size);
+	buf = kmemdup(start, size, GFP_KERNEL);
 	if (buf == NULL)
 		return -ENOMEM;
 
@@ -2684,6 +2684,12 @@ static int __hid_device_probe(struct hid_device *hdev, struct hid_driver *hdrv)
 	const struct hid_device_id *id;
 	int ret;
 
+	if (!hdev->bpf_rsize) {
+		hdev->bpf_rsize = hdev->dev_rsize;
+		hdev->bpf_rdesc = call_hid_bpf_rdesc_fixup(hdev, hdev->dev_rdesc,
+							   &hdev->bpf_rsize);
+	}
+
 	if (!hid_check_device_match(hdev, hdrv, &id))
 		return -ENODEV;
 
@@ -2941,8 +2947,11 @@ static void hid_remove_device(struct hid_device *hdev)
 		hdev->status &= ~HID_STAT_ADDED;
 	}
 	kfree(hdev->dev_rdesc);
+	kfree(hdev->bpf_rdesc);
 	hdev->dev_rdesc = NULL;
+	hdev->bpf_rdesc = NULL;
 	hdev->dev_rsize = 0;
+	hdev->bpf_rsize = 0;
 }
 
 /**
