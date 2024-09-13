@@ -228,7 +228,7 @@ static inline int hid_bpf_connect_device(struct hid_device *hdev) { return 0; }
 static inline void hid_bpf_disconnect_device(struct hid_device *hdev) {}
 static inline void hid_bpf_destroy_device(struct hid_device *hid) {}
 static inline int hid_bpf_device_init(struct hid_device *hid) { return 0; }
-static inline u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, u8 *rdesc,
+static inline u8 *call_hid_bpf_rdesc_fixup(struct hid_device *hdev, const u8 *rdesc,
 					   unsigned int *size) { return NULL; }
 
 #endif /* CONFIG_HID_BPF */
