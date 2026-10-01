@@ -624,10 +624,11 @@ static int magicmouse_setup_input(struct input_dev *input, struct hid_device *hd
 		__clear_bit(BTN_MIDDLE, input->keybit);
 		__set_bit(BTN_MOUSE, input->keybit);
 		__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
 		__set_bit(BTN_TOOL_FINGER, input->keybit);
 
 		mt_flags = INPUT_MT_POINTER | INPUT_MT_DROP_UNUSED |
-				INPUT_MT_TRACK;
+				INPUT_MT_TRACK | INPUT_MT_TOTAL_FORCE;
 	} else { /* USB_DEVICE_ID_APPLE_MAGICTRACKPAD */
 		/* input->keybit is initialized with incorrect button info
 		 * for Magic Trackpad. There really is only one physical
