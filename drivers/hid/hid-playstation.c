@@ -824,6 +824,7 @@ static int ps_get_report(struct hid_device *hdev, u8 report_id, u8 *buf,
 		u32 report_crc = get_unaligned_le32(&buf[crc_offset]);
 
 		if (!ps_check_crc32(PS_FEATURE_CRC32_SEED, buf, crc_offset, report_crc)) {
+			/* hid_err_ratelimited() not used on driver-initiated requests */
 			hid_err(hdev, "CRC check failed for reportID=%d\n", report_id);
 			return -EILSEQ;
 		}
@@ -1459,7 +1460,7 @@ static int dualsense_parse_report(struct ps_device *ps_dev, struct hid_report *r
 		u32 report_crc = get_unaligned_le32(&data[size - 4]);
 
 		if (!ps_check_crc32(PS_INPUT_CRC32_SEED, data, size - 4, report_crc)) {
-			hid_err(hdev, "DualSense input CRC's check failed\n");
+			hid_err_ratelimited(hdev, "DualSense input CRC's check failed\n");
 			return -EILSEQ;
 		}
 
@@ -2425,7 +2426,7 @@ static int dualshock4_parse_report(struct ps_device *ps_dev, struct hid_report *
 
 		/* Last 4 bytes of input report contains CRC. */
 		if (!ps_check_crc32(PS_INPUT_CRC32_SEED, data, size - 4, report_crc)) {
-			hid_err(hdev, "DualShock4 input CRC's check failed\n");
+			hid_err_ratelimited(hdev, "DualShock4 input CRC's check failed\n");
 			return -EILSEQ;
 		}
 
