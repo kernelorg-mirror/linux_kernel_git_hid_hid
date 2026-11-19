@@ -49,6 +49,7 @@ static const struct regmap_config thc_regmap_cfg = {
 	.reg_write = thc_regmap_write,
 	.cache_type = REGCACHE_NONE,
 	.fast_io = true,
+	.use_raw_spinlock = true,
 	.rd_table = &thc_rw_table,
 	.wr_table = &thc_rw_table,
 	.volatile_table	= &thc_rw_table,
