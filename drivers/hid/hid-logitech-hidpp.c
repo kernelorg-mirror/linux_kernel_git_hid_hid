@@ -1761,11 +1761,14 @@ static int hidpp20_battery_event_1004(struct hidpp_device *hidpp,
 	status = hidpp20_unifiedbattery_map_status(hidpp, params[2], params[3]);
 	level = hidpp20_unifiedbattery_map_level(hidpp, params[1]);
 
-	changed = status != hidpp->battery.status ||
+	changed = !hidpp->battery.online ||
+		  status != hidpp->battery.status ||
 		  (state_of_charge != hidpp->battery.capacity &&
 		   hidpp->capabilities & HIDPP_CAPABILITY_BATTERY_PERCENTAGE) ||
 		  (level != hidpp->battery.level &&
 		   hidpp->capabilities & HIDPP_CAPABILITY_BATTERY_LEVEL_STATUS);
+
+	hidpp->battery.online = true;
 
 	if (changed) {
 		hidpp->battery.capacity = state_of_charge;
@@ -4202,10 +4205,10 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 
 	last_online = hidpp->battery.online;
 	if (hidpp->capabilities & HIDPP_CAPABILITY_HIDPP20_BATTERY) {
-		ret = hidpp20_battery_event_1000(hidpp, data, size);
-		if (ret != 0)
-			return ret;
-		ret = hidpp20_battery_event_1004(hidpp, data, size);
+		if (hidpp->capabilities & HIDPP_CAPABILITY_UNIFIED_BATTERY)
+			ret = hidpp20_battery_event_1004(hidpp, data, size);
+		else
+			ret = hidpp20_battery_event_1000(hidpp, data, size);
 		if (ret != 0)
 			return ret;
 		ret = hidpp_solar_battery_event(hidpp, data, size);
