@@ -300,14 +300,17 @@ static int __do_hidpp_send_message_sync(struct hidpp_device *hidpp,
 
 	__must_hold(&hidpp->send_mutex);
 
-	hidpp->send_receive_buf = response;
-	hidpp->answer_available = false;
-
 	/*
 	 * So that we can later validate the answer when it arrives
 	 * in hidpp_raw_event
 	 */
 	*response = *message;
+	hidpp->answer_available = false;
+	/*
+	 * Pairs with smp_load_acquire() in hidpp_raw_hidpp_event() to ensure
+	 * the response buffer initialization is visible before publishing.
+	 */
+	smp_store_release(&hidpp->send_receive_buf, response);
 
 	ret = __hidpp_send_report(hidpp->hid_dev, message);
 	if (ret) {
@@ -342,7 +345,7 @@ static int __do_hidpp_send_message_sync(struct hidpp_device *hidpp,
 	ret = 0;
 
 out:
-	hidpp->send_receive_buf = NULL;
+	WRITE_ONCE(hidpp->send_receive_buf, NULL);
 	return ret;
 }
 
@@ -4150,11 +4153,15 @@ static int hidpp_raw_hidpp_event(struct hidpp_device *hidpp, u8 *data,
 	 * previously sent command.
 	 */
 	if (unlikely(mutex_is_locked(&hidpp->send_mutex))) {
-		question = hidpp->send_receive_buf;
-		answer = hidpp->send_receive_buf;
-
+		/*
+		 * Pairs with smp_store_release() in __do_hidpp_send_message_sync()
+		 * to ensure the initialized response buffer is observed.
+		 */
+		question = smp_load_acquire(&hidpp->send_receive_buf);
 		if (!question)
 			return 0;
+
+		answer = question;
 
 		/*
 		 * Check for a correct hidpp20 answer or the corresponding
