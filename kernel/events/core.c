@@ -1072,8 +1072,13 @@ static void perf_cgroup_switch(struct task_struct *task)
 	 * must not be done before ctxswout due
 	 * to update_cgrp_time_from_cpuctx() in
 	 * ctx_sched_out()
+	 *
+	 * ctx_sched_out() can consume a pending disable and drop the last cgroup
+	 * event, which clear the cpuctx->cgrp. Cgroup tracking follow active cgroup
+	 * event, so do not resurrect it
 	 */
-	cpuctx->cgrp = cgrp;
+	if (cpuctx->ctx.nr_cgroups)
+		cpuctx->cgrp = cgrp;
 	/*
 	 * set cgrp before ctxsw in to allow
 	 * perf_cgroup_set_timestamp() in ctx_sched_in()
@@ -1332,14 +1337,19 @@ static int perf_mux_hrtimer_restart(struct perf_cpu_pmu_context *cpc)
 	return 0;
 }
 
-static int perf_mux_hrtimer_restart_ipi(void *arg)
-{
-	return perf_mux_hrtimer_restart(arg);
-}
-
 static __always_inline struct perf_cpu_pmu_context *this_cpc(struct pmu *pmu)
 {
 	return *this_cpu_ptr(pmu->cpu_pmu_context);
+}
+
+static int perf_mux_hrtimer_interval_ipi(void *arg)
+{
+	struct pmu *pmu = arg;
+	struct perf_cpu_pmu_context *cpc = this_cpc(pmu);
+	int ms = pmu->hrtimer_interval_ms;
+
+	cpc->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * ms);
+	return perf_mux_hrtimer_restart(cpc);
 }
 
 void perf_pmu_disable(struct pmu *pmu)
@@ -2590,6 +2600,7 @@ __perf_remove_from_context(struct perf_event *event,
 	enum perf_event_state state = PERF_EVENT_STATE_OFF;
 	unsigned long flags = (unsigned long)info;
 
+	perf_pmu_disable(pmu_ctx->pmu);
 	ctx_time_update(cpuctx, ctx);
 
 	/*
@@ -2602,6 +2613,13 @@ __perf_remove_from_context(struct perf_event *event,
 		state = PERF_EVENT_STATE_REVOKED;
 	if (flags & DETACH_DEAD)
 		state = PERF_EVENT_STATE_DEAD;
+
+	/*
+	 * When disabling a group leader, the whole group becomes ineligible
+	 * to run, so schedule out the full group.
+	 */
+	if (!(flags & DETACH_GROUP) && event == event->group_leader)
+		group_sched_out(event, ctx);
 
 	__event_disable(event, ctx, state);
 
@@ -2632,6 +2650,7 @@ __perf_remove_from_context(struct perf_event *event,
 			cpuctx->task_ctx = NULL;
 		}
 	}
+	perf_pmu_enable(pmu_ctx->pmu);
 }
 
 /*
@@ -5347,7 +5366,7 @@ static bool is_sb_event(struct perf_event *event)
 	    attr->comm || attr->comm_exec ||
 	    attr->task || attr->ksymbol ||
 	    attr->context_switch || attr->text_poke ||
-	    attr->bpf_event)
+	    attr->bpf_event || attr->defer_output)
 		return true;
 
 	return false;
@@ -5434,6 +5453,9 @@ attach_task_ctx_data(struct task_struct *task, struct kmem_cache *ctx_cache,
 		return -ENOMEM;
 
 	for (;;) {
+		/* Protect @old until inc_not_zero(&old->refcount) */
+		guard(rcu)();
+
 		if (try_cmpxchg(&task->perf_ctx_data, &old, cd)) {
 			if (old)
 				perf_free_ctx_data_rcu(old);
@@ -7635,6 +7657,15 @@ static void perf_sigtrap(struct perf_event *event)
 		return;
 
 	/*
+	 * The event was removed after this signal was queued, e.g. by exec()
+	 * (remove_on_exec), which may also have closed its fd (close-on-exec).
+	 * The new program has default signal handlers, so a SIGTRAP would
+	 * kill it.
+	 */
+	if (READ_ONCE(event->state) <= PERF_EVENT_STATE_EXIT)
+		return;
+
+	/*
 	 * We'd expect this to only occur if the irq_work is delayed and either
 	 * ctx->task or current has changed in the meantime. This can be the
 	 * case on architectures that do not implement arch_irq_work_raise().
@@ -7907,8 +7938,8 @@ perf_output_sample_simd_regs(struct perf_output_handle *handle,
 	}
 }
 
-static void perf_sample_regs_user(struct perf_regs *regs_user,
-				  struct pt_regs *regs)
+void perf_sample_regs_user(struct perf_regs *regs_user,
+			   struct pt_regs *regs)
 {
 	if (user_mode(regs)) {
 		regs_user->abi = perf_reg_abi(current);
@@ -7921,9 +7952,9 @@ static void perf_sample_regs_user(struct perf_regs *regs_user,
 	}
 }
 
-static void perf_sample_regs_intr(struct perf_regs *regs_intr,
-				  struct pt_regs *regs,
-				  bool exclude_kernel)
+void perf_sample_regs_intr(struct perf_regs *regs_intr,
+			   struct pt_regs *regs,
+			   bool exclude_kernel)
 {
 	/*
 	 * Hardware skid can lead to a scenario where a PMI is
@@ -9915,7 +9946,7 @@ static void perf_event_mmap_event(struct perf_mmap_event *mmap_event)
 
 	if (vma->vm_flags & VM_LOCKED)
 		flags |= MAP_LOCKED;
-	if (is_vm_hugetlb_page(vma))
+	if (vma_is_hugetlb(vma))
 		flags |= MAP_HUGETLB;
 
 	if (file) {
@@ -10502,8 +10533,6 @@ struct perf_callchain_deferred_event {
 	struct {
 		struct perf_event_header	header;
 		u64				cookie;
-		u64				nr;
-		u64				ips[];
 	} event;
 };
 
@@ -10512,11 +10541,18 @@ static void perf_callchain_deferred_output(struct perf_event *event, void *data)
 	struct perf_callchain_deferred_event *deferred_event = data;
 	struct perf_output_handle handle;
 	struct perf_sample_data sample;
+	u64 nr = deferred_event->trace->nr;
+	u16 size, id_size, max_payload;
 	int ret;
-	u16 size = sizeof(deferred_event->event) + (deferred_event->trace->nr * sizeof(u64));
 
 	if (!event->attr.defer_output)
 		return;
+
+	id_size = event->attr.sample_id_all ? event->id_header_size : 0;
+	max_payload = round_down(U16_MAX - sizeof(deferred_event->event) -
+				 sizeof(u64) - id_size, sizeof(u64));
+	nr = min_t(u64, nr, max_payload / sizeof(u64));
+	size = sizeof(deferred_event->event) + sizeof(u64) + nr * sizeof(u64);
 
 	/* XXX do we really need sample_id_all for this ??? */
 	perf_event_header__init(&deferred_event->event.header, &sample,
@@ -10531,8 +10567,10 @@ static void perf_callchain_deferred_output(struct perf_event *event, void *data)
 		return;
 
 	perf_output_put(&handle, deferred_event->event);
-	for (int i = 0; i < deferred_event->trace->nr; i++) {
+	perf_output_put(&handle, nr);
+	for (u64 i = 0; i < nr; i++) {
 		u64 entry = deferred_event->trace->entries[i];
+
 		perf_output_put(&handle, entry);
 	}
 	perf_event__output_id_sample(event, &handle, &sample);
@@ -10547,7 +10585,6 @@ static void perf_unwind_deferred_callback(struct unwind_work *work,
 		.trace = trace,
 		.event = {
 			.cookie = cookie,
-			.nr = trace->nr,
 		},
 	};
 
@@ -12753,13 +12790,8 @@ perf_event_mux_interval_ms_store(struct device *dev,
 
 	/* update all cpuctx for this PMU */
 	cpus_read_lock();
-	for_each_online_cpu(cpu) {
-		struct perf_cpu_pmu_context *cpc;
-		cpc = *per_cpu_ptr(pmu->cpu_pmu_context, cpu);
-		cpc->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * timer);
-
-		cpu_function_call(cpu, perf_mux_hrtimer_restart_ipi, cpc);
-	}
+	for_each_online_cpu(cpu)
+		cpu_function_call(cpu, perf_mux_hrtimer_interval_ipi, pmu);
 	cpus_read_unlock();
 	mutex_unlock(&mux_interval_mutex);
 

@@ -881,6 +881,8 @@ struct task_struct {
 	 */
 	int				recent_used_cpu;
 	int				wake_cpu;
+	/* CPU charged while is_blocked && in_iowait. */
+	int				iowait_cpu;
 
 	int				prio;
 	int				static_prio;
@@ -1814,8 +1816,8 @@ extern struct pid __rcu *cad_pid;
 #define PF_USED_MATH		0x00002000	/* If unset the fpu must be initialized before use */
 #define PF_USER_WORKER		0x00004000	/* Kernel thread cloned from userspace thread */
 #define PF_NOFREEZE		0x00008000	/* This thread should not be frozen */
-#define PF_KCOMPACTD		0x00010000	/* I am kcompactd */
-#define PF_KSWAPD		0x00020000	/* I am kswapd */
+#define PF__HOLE__00010000	0x00010000
+#define PF__HOLE__00020000	0x00020000
 #define PF_MEMALLOC_NOFS	0x00040000	/* All allocations inherit GFP_NOFS. See memalloc_nfs_save() */
 #define PF_MEMALLOC_NOIO	0x00080000	/* All allocations inherit GFP_NOIO. See memalloc_noio_save() */
 #define PF_LOCAL_THROTTLE	0x00100000	/* Throttle writes only against the bdi I write to,

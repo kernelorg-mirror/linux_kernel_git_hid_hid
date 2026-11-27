@@ -1019,7 +1019,7 @@ static int hid_sensor_custom_probe(struct platform_device *pdev)
 	int ret;
 	const struct hid_sensor_custom_match *match;
 
-	sensor_inst = kzalloc(sizeof(*sensor_inst), GFP_KERNEL);
+	sensor_inst = kzalloc_obj(*sensor_inst);
 	if (!sensor_inst)
 		return -ENOMEM;
 

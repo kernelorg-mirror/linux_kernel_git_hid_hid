@@ -57,13 +57,6 @@ int renameat2(int olddirfd, const char *oldpath, int newdirfd,
 }
 #endif
 
-#ifndef open_tree
-int open_tree(int dfd, const char *filename, unsigned int flags)
-{
-	return syscall(__NR_open_tree, dfd, filename, flags);
-}
-#endif
-
 static int sys_execveat(int dirfd, const char *pathname, char *const argv[],
 			char *const envp[], int flags)
 {
@@ -2620,6 +2613,60 @@ TEST_F_FORK(layout1, refer_denied_by_default4)
 }
 
 /*
+ * Regression test for layered domains: The two enforced Landlock layers both do
+ * not restrict the tested "refer" operations on their own, so they should also
+ * not restrict them when they are layered, regardless of the layer order.
+ */
+static void test_layering_does_not_break_refer(
+	struct __test_metadata *const _metadata,
+	const struct landlock_ruleset_attr *const non_fs_attr,
+	const bool non_fs_first)
+{
+	ASSERT_EQ(0, unlink(file1_s1d2));
+
+	if (non_fs_first)
+		drop_access_rights(_metadata, non_fs_attr);
+
+	enforce_fs(_metadata, LANDLOCK_ACCESS_FS_REFER, layer_dir_s1d1_refer);
+
+	if (!non_fs_first)
+		drop_access_rights(_metadata, non_fs_attr);
+
+	EXPECT_EQ(0, test_rename(file1_s1d1, file1_s1d2));
+	EXPECT_EQ(0, test_rename(file1_s1d2, file1_s1d1));
+	EXPECT_EQ(0, test_exchange(file2_s1d1, file2_s1d2));
+	EXPECT_EQ(0, test_exchange(file2_s1d2, file2_s1d1));
+}
+
+static const struct landlock_ruleset_attr net_attr = {
+	.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP,
+};
+
+static const struct landlock_ruleset_attr scoped_attr = {
+	.scoped = LANDLOCK_SCOPE_SIGNAL,
+};
+
+TEST_F_FORK(layout1, layering_fs_then_net_does_not_break_refer)
+{
+	test_layering_does_not_break_refer(_metadata, &net_attr, false);
+}
+
+TEST_F_FORK(layout1, layering_net_then_fs_does_not_break_refer)
+{
+	test_layering_does_not_break_refer(_metadata, &net_attr, true);
+}
+
+TEST_F_FORK(layout1, layering_fs_then_scoped_does_not_break_refer)
+{
+	test_layering_does_not_break_refer(_metadata, &scoped_attr, false);
+}
+
+TEST_F_FORK(layout1, layering_scoped_then_fs_does_not_break_refer)
+{
+	test_layering_does_not_break_refer(_metadata, &scoped_attr, true);
+}
+
+/*
  * Tests walking through a denied root mount.
  */
 TEST_F_FORK(layout1, refer_mount_root_deny)
@@ -2628,9 +2675,9 @@ TEST_F_FORK(layout1, refer_mount_root_deny)
 
 	/* Creates a mount object from a non-mount point. */
 	set_cap(_metadata, CAP_SYS_ADMIN);
-	root_fd =
-		open_tree(AT_FDCWD, dir_s1d1,
-			  AT_EMPTY_PATH | OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC);
+	root_fd = sys_open_tree(AT_FDCWD, dir_s1d1,
+				AT_EMPTY_PATH | OPEN_TREE_CLONE |
+					OPEN_TREE_CLOEXEC);
 	clear_cap(_metadata, CAP_SYS_ADMIN);
 	ASSERT_LE(0, root_fd);
 
@@ -2987,8 +3034,8 @@ TEST_F_FORK(layout1, reparent_exdev_layers_rename1)
 
 	/*
 	 * Moving the file2_s1d3 file below dir_s2d3 is denied because the
-	 * second layer does not handle REFER, which is always denied by
-	 * default.
+	 * second layer does not handle REFER, which is always denied as soon as
+	 * any other filesystem access right is handled.
 	 */
 	ASSERT_EQ(-1, rename(file2_s1d3, file1_s2d3));
 	ASSERT_EQ(EXDEV, errno);
@@ -3026,7 +3073,8 @@ TEST_F_FORK(layout1, reparent_exdev_layers_rename2)
 	ASSERT_EQ(EXDEV, errno);
 	/*
 	 * Modifying the layout is now denied because the second layer does not
-	 * handle REFER, which is always denied by default.
+	 * handle REFER, which is always denied as soon as any other filesystem
+	 * access right is handled.
 	 */
 	ASSERT_EQ(-1, rename(file2_s1d2, file1_s2d3));
 	ASSERT_EQ(EXDEV, errno);

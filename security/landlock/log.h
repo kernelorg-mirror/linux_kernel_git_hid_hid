@@ -13,10 +13,12 @@
 
 #include "access.h"
 
+struct cred;
 struct landlock_cred_security;
 struct landlock_hierarchy;
 struct sockaddr;
 struct task_struct;
+struct user_namespace;
 
 enum landlock_request_type {
 	LANDLOCK_REQUEST_PTRACE = 1,
@@ -25,9 +27,13 @@ enum landlock_request_type {
 	LANDLOCK_REQUEST_NET_ACCESS,
 	LANDLOCK_REQUEST_SCOPE_ABSTRACT_UNIX_SOCKET,
 	LANDLOCK_REQUEST_SCOPE_SIGNAL,
+	LANDLOCK_REQUEST_NAMESPACE_CREATE,
+	LANDLOCK_REQUEST_NAMESPACE_ENTER,
+	LANDLOCK_REQUEST_CAPABILITY,
 };
 
 struct landlock_blockers {
+	/* Blocking access rights or permissions, as selected by @type. */
 	access_mask_t access;
 	enum landlock_request_type type;
 };
@@ -50,6 +56,11 @@ struct landlock_signal_trace {
 	int signal;
 };
 
+struct landlock_cap_trace {
+	const struct cred *cred;
+	const struct user_namespace *user_ns;
+};
+
 #endif /* CONFIG_TRACEPOINTS */
 
 /*
@@ -58,8 +69,13 @@ struct landlock_signal_trace {
  * CONFIG_SECURITY_LANDLOCK_LOG is not set.
  */
 struct landlock_request {
-	/* Mandatory fields. */
+	/* Mandatory request type. */
 	enum landlock_request_type type;
+
+	/* Required field for permission requests. */
+	access_mask_t permission;
+
+	/* Mandatory audit context. */
 	struct common_audit_data audit;
 
 	/**
@@ -95,6 +111,8 @@ struct landlock_request {
 		const struct landlock_ptrace_trace *trace_ptrace;
 		/* Synchronous context for a signal denial. */
 		const struct landlock_signal_trace *trace_signal;
+		/* Synchronous context for a capability denial. */
+		const struct landlock_cap_trace *trace_cap;
 	};
 #endif /* CONFIG_TRACEPOINTS */
 };

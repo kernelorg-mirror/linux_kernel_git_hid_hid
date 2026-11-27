@@ -1027,6 +1027,7 @@ out:
 }
 
 static int isl7998x_set_fmt(struct v4l2_subdev *sd,
+			    const struct v4l2_subdev_client_info *ci,
 			    struct v4l2_subdev_state *sd_state,
 			    struct v4l2_subdev_format *format)
 {
@@ -1466,7 +1467,7 @@ static int isl7998x_probe(struct i2c_client *client)
 		return -EIO;
 	}
 
-	isl7998x = devm_kzalloc(dev, sizeof(*isl7998x), GFP_KERNEL);
+	isl7998x = devm_kzalloc_obj(dev, *isl7998x);
 	if (!isl7998x)
 		return -ENOMEM;
 

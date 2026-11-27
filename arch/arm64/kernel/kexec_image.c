@@ -25,10 +25,10 @@ static int image_probe(const char *kernel_buf, unsigned long kernel_len)
 		(const struct arm64_image_header *)(kernel_buf);
 
 	if (!h || (kernel_len < sizeof(*h)))
-		return -EINVAL;
+		return -ENOEXEC;
 
 	if (memcmp(&h->magic, ARM64_IMAGE_MAGIC, sizeof(h->magic)))
-		return -EINVAL;
+		return -ENOEXEC;
 
 	return 0;
 }
@@ -81,6 +81,13 @@ static void *image_load(struct kimage *image,
 	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 	kbuf.memsz = le64_to_cpu(h->image_size);
 	text_offset = le64_to_cpu(h->text_offset);
+	/*
+	 * A CMA segment is loaded and mapped through page_address(cma), which
+	 * is the CMA base and cannot represent the text_offset adjustment
+	 * below.  Load images with a non-zero text_offset from normal memory.
+	 */
+	if (text_offset)
+		image->no_cma = true;
 	kbuf.buf_align = MIN_KIMG_ALIGN;
 
 	/* Adjust kernel segment with TEXT_OFFSET */

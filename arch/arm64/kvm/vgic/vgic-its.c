@@ -776,12 +776,30 @@ static void its_free_ite(struct kvm *kvm, struct its_ite *ite)
 				its_unmap_vlpi(ite->irq->host_irq);
 
 			irq->hw = false;
+			irq->mapped = false;
 		}
 
 		vgic_put_irq(kvm, ite->irq);
 	}
 
 	kfree(ite);
+}
+
+/* Mapping one LPI from two events is UNPREDICTABLE: the first ITE keeps it. */
+static bool vgic_its_map_lpi(struct kvm *kvm, struct its_ite *ite,
+			     struct vgic_irq *irq, struct kvm_vcpu *vcpu)
+{
+	scoped_guard(raw_spinlock_irqsave, &irq->irq_lock) {
+		if (!irq->mapped) {
+			irq->mapped = true;
+			irq->target_vcpu = vcpu;
+			ite->irq = irq;
+			return true;
+		}
+	}
+
+	vgic_put_irq(kvm, irq);
+	return false;
 }
 
 static u64 its_cmd_mask_field(u64 *its_cmd, int word, int shift, int size)
@@ -800,6 +818,38 @@ static u64 its_cmd_mask_field(u64 *its_cmd, int word, int shift, int size)
 #define its_cmd_get_validbit(cmd)	its_cmd_mask_field(cmd, 2, 63,  1)
 
 /*
+ * Only an LPI on a vCPU's AP list can be in its list registers, which the
+ * exit path folds back, and that exit moves the LPI to its target vCPU if
+ * the target has changed: pause both. Clear an LPI on no AP list before
+ * dropping the lock, so that nothing can put it in a list register first.
+ * Must be called with the its_lock mutex held.
+ */
+static void vgic_its_clear_pending(struct vgic_irq *irq)
+{
+	struct kvm_vcpu *vcpu, *target;
+
+	scoped_guard(raw_spinlock_irqsave, &irq->irq_lock) {
+		vcpu = irq->vcpu;
+		target = irq->target_vcpu;
+		if (!vcpu)
+			irq->pending_latch = false;
+	}
+
+	if (vcpu) {
+		if (target != vcpu)
+			kvm_pause_vcpu(target);
+		kvm_pause_vcpu(vcpu);
+
+		scoped_guard(raw_spinlock_irqsave, &irq->irq_lock)
+			irq->pending_latch = false;
+
+		kvm_resume_vcpu(vcpu);
+		if (target != vcpu)
+			kvm_resume_vcpu(target);
+	}
+}
+
+/*
  * The DISCARD command frees an Interrupt Translation Table Entry (ITTE).
  * Must be called with the its_lock mutex held.
  */
@@ -815,13 +865,9 @@ static int vgic_its_cmd_handle_discard(struct kvm *kvm, struct vgic_its *its,
 		struct its_device *device = find_its_device(its, device_id);
 		int ite_esz = vgic_its_get_abi(its)->ite_esz;
 		gpa_t gpa = device->itt_addr + ite->event_id * ite_esz;
-		/*
-		 * Though the spec talks about removing the pending state, we
-		 * don't bother here since we clear the ITTE anyway and the
-		 * pending state is a property of the ITTE struct.
-		 */
-		vgic_its_invalidate_cache(its);
 
+		vgic_its_invalidate_cache(its);
+		vgic_its_clear_pending(ite->irq);
 		its_free_ite(kvm, ite);
 
 		return vgic_its_write_entry_lock(its, gpa, 0ULL, ite);
@@ -1093,13 +1139,14 @@ static int vgic_its_cmd_handle_mapi(struct kvm *kvm, struct vgic_its *its,
 		vcpu = collection_to_vcpu(kvm, collection);
 
 	irq = vgic_add_lpi(kvm, lpi_nr, vcpu);
+	if (!IS_ERR(irq) && !vgic_its_map_lpi(kvm, ite, irq, vcpu))
+		irq = ERR_PTR(-EEXIST);
 	if (IS_ERR(irq)) {
 		if (new_coll)
 			vgic_its_free_collection(its, coll_id);
 		its_free_ite(kvm, ite);
 		return PTR_ERR(irq);
 	}
-	ite->irq = irq;
 
 	return 0;
 }
@@ -1265,10 +1312,10 @@ static int vgic_its_cmd_handle_clear(struct kvm *kvm, struct vgic_its *its,
 
 
 	ite = find_ite(its, device_id, event_id);
-	if (!ite)
+	if (!ite || !its_is_collection_mapped(ite->collection))
 		return E_ITS_CLEAR_UNMAPPED_INTERRUPT;
 
-	ite->irq->pending_latch = false;
+	vgic_its_clear_pending(ite->irq);
 
 	if (ite->irq->hw)
 		return irq_set_irqchip_state(ite->irq->host_irq,
@@ -1382,6 +1429,15 @@ static int vgic_its_cmd_handle_movall(struct kvm *kvm, struct vgic_its *its,
 	if (vcpu1 == vcpu2)
 		return 0;
 
+	/*
+	 * Bulk operations such as MOVALL are a pain, as they can clash
+	 * badly locking-wise with other vcpus entering and exiting the
+	 * guest, should they be affected by it. Stopping the guest is a
+	 * safer bet to ensure uncontended access and ultimately forward
+	 * progress. Yeah...
+	 */
+	kvm_arm_halt_guest(kvm);
+
 	xa_for_each(&dist->lpi_xa, intid, irq) {
 		irq = vgic_get_irq(kvm, intid);
 		if (!irq)
@@ -1393,6 +1449,8 @@ static int vgic_its_cmd_handle_movall(struct kvm *kvm, struct vgic_its *its,
 	}
 
 	vgic_its_invalidate_cache(its);
+
+	kvm_arm_resume_guest(kvm);
 
 	return 0;
 }
@@ -1747,9 +1805,12 @@ static void vgic_mmio_write_its_ctlr(struct kvm *kvm, struct vgic_its *its,
 		 !(its->cbaser & GITS_CBASER_VALID)))
 		goto out;
 
+	/* vgic_its_resolve_lpi() tests the enable bit and caches under its_lock. */
+	mutex_lock(&its->its_lock);
 	its->enabled = !!(val & GITS_CTLR_ENABLE);
 	if (!its->enabled)
 		vgic_its_invalidate_cache(its);
+	mutex_unlock(&its->its_lock);
 
 	/*
 	 * Try to process any pending commands. This function bails out early
@@ -1875,6 +1936,19 @@ static int vgic_its_create(struct kvm_device *dev, u32 type)
 
 	mutex_lock(&dev->kvm->arch.config_lock);
 
+	/*
+	 * Reject creation of a GICv3 ITS if:
+	 * - The VM already has a VGIC other than GICv3.
+	 * - An existing ITS requires a VGIC model other than GICv3.
+	 */
+	if ((irqchip_in_kernel(dev->kvm) && !vgic_is_v3(dev->kvm)) ||
+	    (dev->kvm->arch.vgic.its_model &&
+	     dev->kvm->arch.vgic.its_model != KVM_DEV_TYPE_ARM_VGIC_V3)) {
+		mutex_unlock(&dev->kvm->arch.config_lock);
+		kfree(its);
+		return -ENODEV;
+	}
+
 	if (vgic_initialized(dev->kvm)) {
 		ret = vgic_v4_init(dev->kvm);
 		if (ret < 0) {
@@ -1902,7 +1976,7 @@ static int vgic_its_create(struct kvm_device *dev, u32 type)
 	xa_init(&its->translation_cache);
 
 	dev->kvm->arch.vgic.msis_require_devid = true;
-	dev->kvm->arch.vgic.has_its = true;
+	dev->kvm->arch.vgic.its_model = KVM_DEV_TYPE_ARM_VGIC_V3;
 	its->enabled = false;
 	its->dev = dev;
 
@@ -2134,9 +2208,9 @@ static int vgic_its_save_ite(struct vgic_its *its, struct its_device *dev,
 	u64 val;
 
 	/*
-	 * MAPC with V=0 keeps the ITEs mapped but drops their collection,
-	 * and with it the ICID. Save a zeroed entry, which the restore path
-	 * reads back as invalid.
+	 * MAPC with V=0 and clearing GITS_BASER<coll>.Valid both keep the
+	 * ITEs mapped while dropping their collection, and with it the ICID.
+	 * Save a zeroed entry, which the restore path reads back as invalid.
 	 */
 	if (!ite->collection)
 		return vgic_its_write_entry_lock(its, gpa, 0ULL, ite);
@@ -2208,7 +2282,10 @@ static int vgic_its_restore_ite(struct vgic_its *its, u32 event_id,
 		its_free_ite(kvm, ite);
 		return PTR_ERR(irq);
 	}
-	ite->irq = irq;
+
+	/* Drop an ITE whose LPI another ITE maps, as MAPTI does. */
+	if (!vgic_its_map_lpi(kvm, ite, irq, vcpu))
+		its_free_ite(kvm, ite);
 
 	return offset;
 }

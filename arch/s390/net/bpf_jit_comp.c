@@ -828,6 +828,14 @@ static int bpf_jit_probe_post(struct bpf_jit *jit, struct bpf_prog *fp,
 	return 0;
 }
 
+static void emit_shift_count32(struct bpf_jit *jit, u32 src_reg)
+{
+	/* risbg %w1,%src,59,128+63,0 */
+	_EMIT6(0xec000000 | reg(REG_W1, src_reg) << 16 | 59 << 8 | (0x80 | 63), 0x0055);
+	REG_SET_SEEN(REG_W1);
+	REG_SET_SEEN(src_reg);
+}
+
 static int emit_ldx(struct bpf_jit *jit, struct bpf_prog *fp, struct bpf_insn *insn)
 {
 	struct bpf_jit_probe probe;
@@ -995,6 +1003,17 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 			if (jit->prg_buf)
 				*(u16 *)(jit->prg_buf + patch_brc + 2) =
 					(jit->prg - patch_brc) >> 1;
+			break;
+		}
+		if (insn_is_mov_percpu_addr(insn)) {
+			const u64 *percpu_offset = &get_lowcore()->percpu_offset;
+
+			if (dst_reg != src_reg)
+				/* lgr %dst,%src */
+				EMIT4(0xb9040000, dst_reg, src_reg);
+			/* ag %dst,percpu_offset */
+			EMIT6_DISP_LH(0xe3000000, 0x0008, dst_reg, REG_0, REG_0,
+				      (unsigned long)percpu_offset);
 			break;
 		}
 		switch (insn->off) {
@@ -1400,9 +1419,10 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 	/*
 	 * BPF_LSH
 	 */
-	case BPF_ALU | BPF_LSH | BPF_X: /* dst = (u32) dst << (u32) src */
-		/* sll %dst,0(%src) */
-		EMIT4_DISP(0x89000000, dst_reg, src_reg, 0);
+	case BPF_ALU | BPF_LSH | BPF_X: /* dst = (u32) dst << ((u32) src & 31) */
+		emit_shift_count32(jit, src_reg);
+		/* sll %dst,0(%w1) */
+		EMIT4_DISP(0x89000000, dst_reg, REG_W1, 0);
 		EMIT_ZERO(dst_reg);
 		break;
 	case BPF_ALU64 | BPF_LSH | BPF_X: /* dst = dst << src */
@@ -1425,9 +1445,10 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 	/*
 	 * BPF_RSH
 	 */
-	case BPF_ALU | BPF_RSH | BPF_X: /* dst = (u32) dst >> (u32) src */
-		/* srl %dst,0(%src) */
-		EMIT4_DISP(0x88000000, dst_reg, src_reg, 0);
+	case BPF_ALU | BPF_RSH | BPF_X: /* dst = (u32) dst >> ((u32) src & 31) */
+		emit_shift_count32(jit, src_reg);
+		/* srl %dst,0(%w1) */
+		EMIT4_DISP(0x88000000, dst_reg, REG_W1, 0);
 		EMIT_ZERO(dst_reg);
 		break;
 	case BPF_ALU64 | BPF_RSH | BPF_X: /* dst = dst >> src */
@@ -1450,9 +1471,10 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 	/*
 	 * BPF_ARSH
 	 */
-	case BPF_ALU | BPF_ARSH | BPF_X: /* ((s32) dst) >>= src */
-		/* sra %dst,%dst,0(%src) */
-		EMIT4_DISP(0x8a000000, dst_reg, src_reg, 0);
+	case BPF_ALU | BPF_ARSH | BPF_X: /* ((s32) dst) >>= (u32) src & 31 */
+		emit_shift_count32(jit, src_reg);
+		/* sra %dst,0(%w1) */
+		EMIT4_DISP(0x8a000000, dst_reg, REG_W1, 0);
 		EMIT_ZERO(dst_reg);
 		break;
 	case BPF_ALU64 | BPF_ARSH | BPF_X: /* ((s64) dst) >>= src */
@@ -1855,9 +1877,9 @@ static noinline int bpf_jit_insn(struct bpf_jit *jit, struct bpf_prog *fp,
 		if ((void *)func == arch_bpf_timed_may_goto) {
 			/*
 			 * arch_bpf_timed_may_goto() has a special ABI: the
-			 * parameters are in BPF_REG_AX and BPF_REG_10; the
-			 * return value is in BPF_REG_AX; and all GPRs except
-			 * REG_W0, REG_W1, and BPF_REG_AX are callee-saved.
+			 * parameter is in BPF_REG_AX; the return value is in
+			 * BPF_REG_AX; and all GPRs except REG_W0, REG_W1, and
+			 * BPF_REG_AX are callee-saved.
 			 */
 
 			/* brasl %r0,func */
@@ -2260,10 +2282,11 @@ static int bpf_jit_prog(struct bpf_jit *jit, struct bpf_prog *fp,
 	else
 		jit->frame_off = 0;
 
-	kern_arena = bpf_arena_get_kern_vm_start(fp->aux->arena);
-	if (kern_arena)
+	if (bpf_prog_uses_arena_insns(fp)) {
+		kern_arena = bpf_arena_get_kern_vm_start(fp->aux->arena);
 		jit->kern_arena = _EMIT_CONST_U64(kern_arena);
-	jit->user_arena = bpf_arena_get_user_vm_start(fp->aux->arena);
+		jit->user_arena = bpf_arena_get_user_vm_start(fp->aux->arena);
+	}
 
 	bpf_jit_prologue(jit, fp);
 	if (bpf_set_addr(jit, 0) < 0)
@@ -2374,7 +2397,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
 	}
 
 	memset(&jit, 0, sizeof(jit));
-	jit.addrs = kvcalloc(fp->len + 1, sizeof(*jit.addrs), GFP_KERNEL);
+	jit.addrs = kvzalloc_objs(*jit.addrs, fp->len + 1);
 	if (jit.addrs == NULL)
 		goto out_err;
 	/*
@@ -2416,8 +2439,6 @@ skip_init_ctx:
 	fp->jited_len = jit.size - cfi_get_offset();
 
 	if (!fp->is_func || extra_pass) {
-		for (int i = 0; i < fp->len; i++)
-			jit.addrs[i] -= cfi_get_offset();
 		bpf_prog_fill_jited_linfo(fp, jit.addrs + 1);
 free_addrs:
 		kvfree(jit.addrs);
@@ -3100,6 +3121,11 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *, u64, u64, u64),
 }
 
 bool bpf_jit_supports_timed_may_goto(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_percpu_insn(void)
 {
 	return true;
 }

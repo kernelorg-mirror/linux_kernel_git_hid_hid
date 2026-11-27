@@ -1169,6 +1169,8 @@ static struct btrfs_root *btrfs_get_global_root(struct btrfs_fs_info *fs_info,
 		return btrfs_grab_root(fs_info->stripe_root);
 	case BTRFS_REMAP_TREE_OBJECTID:
 		return btrfs_grab_root(fs_info->remap_root);
+	case BTRFS_DATA_RELOC_TREE_OBJECTID:
+		return btrfs_grab_root(fs_info->data_reloc_root);
 	default:
 		return NULL;
 	}
@@ -1304,8 +1306,15 @@ static struct btrfs_root *btrfs_get_root_ref(struct btrfs_fs_info *fs_info,
 	 *
 	 * This is namely for free-space-tree and quota tree, which can change
 	 * at runtime and should only be grabbed from fs_info.
+	 *
+	 * The data reloc tree is also such a tree.  It is loaded at mount time
+	 * by read_data_reloc_root() and never inserted into the radix tree, as
+	 * radix tree keys are of type `unsigned long`, which is 32 bits wide
+	 * on 32-bit platforms.
+	 * Casting the objectid to `unsigned long` can therefore result in a
+	 * conflict with a subvolume.
 	 */
-	if (!btrfs_is_fstree(objectid) && objectid != BTRFS_DATA_RELOC_TREE_OBJECTID)
+	if (!btrfs_is_fstree(objectid))
 		return ERR_PTR(-ENOENT);
 again:
 	root = btrfs_lookup_fs_root(fs_info, objectid);
@@ -1407,6 +1416,39 @@ struct btrfs_root *btrfs_get_new_fs_root(struct btrfs_fs_info *fs_info,
 					 u64 objectid, dev_t *anon_dev)
 {
 	return btrfs_get_root_ref(fs_info, objectid, anon_dev, true);
+}
+
+/* Read and initialize the data reloc tree. */
+static struct btrfs_root *read_data_reloc_root(struct btrfs_fs_info *fs_info)
+{
+	struct btrfs_key key = {
+		.objectid = BTRFS_DATA_RELOC_TREE_OBJECTID,
+		.type = BTRFS_ROOT_ITEM_KEY,
+		.offset = (u64)-1,
+	};
+	struct btrfs_root *root;
+	int ret;
+
+	root = btrfs_read_tree_root(fs_info->tree_root, &key);
+	if (IS_ERR(root))
+		return root;
+
+	if (btrfs_root_refs(&root->root_item) == 0) {
+		ret = -ENOENT;
+		goto fail;
+	}
+
+	/*
+	 * This tree can share blocks with some other fs tree during
+	 * relocation and we need a proper setup by btrfs_init_fs_root().
+	 */
+	ret = btrfs_init_fs_root(root, 0);
+	if (ret)
+		goto fail;
+	return root;
+fail:
+	btrfs_put_root(root);
+	return ERR_PTR(ret);
 }
 
 /*
@@ -1780,7 +1822,6 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
 	if (fs_info->rmw_workers)
 		destroy_workqueue(fs_info->rmw_workers);
 	btrfs_destroy_workqueue(fs_info->endio_write_workers);
-	btrfs_destroy_workqueue(fs_info->endio_freespace_worker);
 	btrfs_destroy_workqueue(fs_info->delayed_workers);
 	btrfs_destroy_workqueue(fs_info->caching_workers);
 	btrfs_destroy_workqueue(fs_info->flush_workers);
@@ -1848,6 +1889,7 @@ void btrfs_put_root(struct btrfs_root *root)
 		if (root->anon_dev)
 			free_anon_bdev(root->anon_dev);
 		free_root_extent_buffers(root);
+		btrfs_qgroup_clean_swapped_blocks(root);
 #ifdef CONFIG_BTRFS_DEBUG
 		spin_lock(&root->fs_info->fs_roots_radix_lock);
 		list_del_init(&root->leak_list);
@@ -1862,6 +1904,25 @@ void btrfs_free_fs_roots(struct btrfs_fs_info *fs_info)
 	int ret;
 	struct btrfs_root *gang[8];
 	int i;
+
+	/*
+	 * Some dirty roots may still be linked to dirty_cowonly_roots after
+	 * the transaction is aborted. Cleanup them here.
+	 */
+	while (!list_empty(&fs_info->dirty_cowonly_roots)) {
+		struct btrfs_root *root;
+
+		root = list_first_entry(&fs_info->dirty_cowonly_roots,
+					struct btrfs_root, dirty_list);
+		list_del_init(&root->dirty_list);
+		/*
+		 * The dirty_log_pages should never be populated for
+		 * cowonly trees.
+		 */
+		spin_lock(&root->dirty_log_pages.lock);
+		ASSERT(RB_EMPTY_ROOT(&root->dirty_log_pages.state));
+		spin_unlock(&root->dirty_log_pages.lock);
+	}
 
 	while (!list_empty(&fs_info->dead_roots)) {
 		gang[0] = list_first_entry(&fs_info->dead_roots,
@@ -1991,9 +2052,6 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 	fs_info->endio_write_workers =
 		btrfs_alloc_workqueue(fs_info, "endio-write", flags,
 				      max_active, 2);
-	fs_info->endio_freespace_worker =
-		btrfs_alloc_workqueue(fs_info, "freespace-write", flags,
-				      max_active, 0);
 	fs_info->delayed_workers =
 		btrfs_alloc_workqueue(fs_info, "delayed-meta", flags,
 				      max_active, 0);
@@ -2006,8 +2064,7 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 	if (!(fs_info->workers &&
 	      fs_info->delalloc_workers && fs_info->flush_workers &&
 	      fs_info->endio_workers && fs_info->endio_meta_workers &&
-	      fs_info->endio_write_workers &&
-	      fs_info->endio_freespace_worker && fs_info->rmw_workers &&
+	      fs_info->endio_write_workers && fs_info->rmw_workers &&
 	      fs_info->caching_workers && fs_info->fixup_workers &&
 	      fs_info->delayed_workers && fs_info->qgroup_rescan_workers &&
 	      fs_info->discard_ctl.discard_workers)) {
@@ -2260,12 +2317,7 @@ static int btrfs_read_roots(struct btrfs_fs_info *fs_info)
 				   PTR_ERR(root));
 		}
 	} else {
-		/*
-		 * This tree can share blocks with some other fs tree during
-		 * relocation and we need a proper setup by btrfs_get_fs_root().
-		 */
-		root = btrfs_get_fs_root(tree_root->fs_info,
-					 BTRFS_DATA_RELOC_TREE_OBJECTID, true);
+		root = read_data_reloc_root(fs_info);
 		if (IS_ERR(root)) {
 			if (!btrfs_test_opt(fs_info, IGNOREBADROOTS)) {
 				location.objectid = BTRFS_DATA_RELOC_TREE_OBJECTID;
@@ -3062,7 +3114,6 @@ static int btrfs_cleanup_fs_roots(struct btrfs_fs_info *fs_info)
 int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
 {
 	int ret;
-	const bool cache_opt = btrfs_test_opt(fs_info, SPACE_CACHE);
 	bool rebuild_free_space_tree = false;
 
 	if (btrfs_test_opt(fs_info, CLEAR_CACHE) &&
@@ -3157,8 +3208,8 @@ int btrfs_start_pre_rw_mount(struct btrfs_fs_info *fs_info)
 		}
 	}
 
-	if (cache_opt != btrfs_free_space_cache_v1_active(fs_info)) {
-		ret = btrfs_set_free_space_cache_v1_active(fs_info, cache_opt);
+	if (btrfs_free_space_cache_v1_active(fs_info)) {
+		ret = btrfs_cleanup_free_space_cache_v1(fs_info);
 		if (ret)
 			return ret;
 	}
@@ -3271,20 +3322,6 @@ int btrfs_check_features(struct btrfs_fs_info *fs_info, bool is_rw_mount)
 	     !btrfs_test_opt(fs_info, FREE_SPACE_TREE))) {
 		btrfs_err(fs_info,
 "block-group-tree feature requires no-holes and free-space-tree features");
-		return -EINVAL;
-	}
-
-	/*
-	 * Subpage/bs > ps runtime limitation on v1 cache.
-	 *
-	 * V1 space cache still has some hard coded PAGE_SIZE usage, while
-	 * we're already defaulting to v2 cache, no need to bother v1 as it's
-	 * going to be deprecated anyway.
-	 */
-	if (fs_info->sectorsize != PAGE_SIZE && btrfs_test_opt(fs_info, SPACE_CACHE)) {
-		btrfs_warn(fs_info,
-	"v1 space cache is not supported for page size %lu with sectorsize %u",
-			   PAGE_SIZE, fs_info->sectorsize);
 		return -EINVAL;
 	}
 
@@ -3815,8 +3852,6 @@ fail_block_groups:
 	btrfs_put_block_group_cache(fs_info);
 
 fail_tree_roots:
-	if (fs_info->data_reloc_root)
-		btrfs_drop_and_free_fs_root(fs_info, fs_info->data_reloc_root);
 	free_root_pointers(fs_info, true);
 	invalidate_and_check_btree_folios(fs_info);
 
@@ -4441,9 +4476,8 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	 * to finish an ordered extent - end_bbio_compressed_write()
 	 * calls btrfs_finish_ordered_extent() which in turns does a call to
 	 * btrfs_queue_ordered_fn(), and that queues the ordered extent
-	 * completion either in the endio_write_workers work queue or in the
-	 * fs_info->endio_freespace_worker work queue. We flush those queues
-	 * below, so before we flush them we must flush this queue for the
+	 * completion in the endio_write_workers work queue. We flush that
+	 * queue below, so before we flush it we must flush this queue for the
 	 * workers of compressed writes.
 	 */
 	flush_workqueue(fs_info->endio_workers);
@@ -4469,8 +4503,6 @@ void __cold close_ctree(struct btrfs_fs_info *fs_info)
 	 * btrfs_finish_ordered_io() when we are unmounting).
 	 */
 	btrfs_flush_workqueue(fs_info->endio_write_workers);
-	/* Ordered extents for free space inodes. */
-	btrfs_flush_workqueue(fs_info->endio_freespace_worker);
 	/*
 	 * Run delayed iputs in case an async reclaim worker is waiting for them
 	 * to be run as mentioned above.
@@ -4859,26 +4891,6 @@ static void btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
 	}
 }
 
-static void btrfs_cleanup_bg_io(struct btrfs_block_group *cache)
-{
-	struct inode *inode;
-
-	inode = cache->io_ctl.inode;
-	if (inode) {
-		unsigned int nofs_flag;
-
-		nofs_flag = memalloc_nofs_save();
-		invalidate_inode_pages2(inode->i_mapping);
-		memalloc_nofs_restore(nofs_flag);
-
-		BTRFS_I(inode)->generation = 0;
-		cache->io_ctl.inode = NULL;
-		iput(inode);
-	}
-	ASSERT(cache->io_ctl.pages == NULL);
-	btrfs_put_block_group(cache);
-}
-
 void btrfs_cleanup_dirty_bgs(struct btrfs_transaction *cur_trans,
 			     struct btrfs_fs_info *fs_info)
 {
@@ -4890,40 +4902,13 @@ void btrfs_cleanup_dirty_bgs(struct btrfs_transaction *cur_trans,
 					 struct btrfs_block_group,
 					 dirty_list);
 
-		if (!list_empty(&cache->io_list)) {
-			spin_unlock(&cur_trans->dirty_bgs_lock);
-			list_del_init(&cache->io_list);
-			btrfs_cleanup_bg_io(cache);
-			spin_lock(&cur_trans->dirty_bgs_lock);
-		}
-
 		list_del_init(&cache->dirty_list);
-		spin_lock(&cache->lock);
-		cache->disk_cache_state = BTRFS_DC_ERROR;
-		spin_unlock(&cache->lock);
-
 		spin_unlock(&cur_trans->dirty_bgs_lock);
 		btrfs_put_block_group(cache);
 		btrfs_dec_delayed_refs_rsv_bg_updates(fs_info);
 		spin_lock(&cur_trans->dirty_bgs_lock);
 	}
 	spin_unlock(&cur_trans->dirty_bgs_lock);
-
-	/*
-	 * Refer to the definition of io_bgs member for details why it's safe
-	 * to use it without any locking
-	 */
-	while (!list_empty(&cur_trans->io_bgs)) {
-		cache = list_first_entry(&cur_trans->io_bgs,
-					 struct btrfs_block_group,
-					 io_list);
-
-		list_del_init(&cache->io_list);
-		spin_lock(&cache->lock);
-		cache->disk_cache_state = BTRFS_DC_ERROR;
-		spin_unlock(&cache->lock);
-		btrfs_cleanup_bg_io(cache);
-	}
 }
 
 static void btrfs_free_all_qgroup_pertrans(struct btrfs_fs_info *fs_info)
@@ -4959,7 +4944,6 @@ void btrfs_cleanup_one_transaction(struct btrfs_transaction *cur_trans)
 
 	btrfs_cleanup_dirty_bgs(cur_trans, fs_info);
 	ASSERT(list_empty(&cur_trans->dirty_bgs));
-	ASSERT(list_empty(&cur_trans->io_bgs));
 
 	list_for_each_entry_safe(dev, tmp, &cur_trans->dev_update_list,
 				 post_commit_list) {

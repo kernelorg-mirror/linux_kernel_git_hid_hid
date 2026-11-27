@@ -43,11 +43,13 @@ struct cs35l56_private {
 	bool soft_resetting;
 	bool sdw_attached;
 	bool component_registered;
+	bool needs_wait_for_fw_idle;
 	struct completion init_completion;
 
 	int speaker_id;
 	u32 rx_mask;
 	u32 tx_mask;
+	u8 asp_tx_input[4];
 	u8 asp_slot_width;
 	u8 asp_slot_count;
 	bool tdm_mode;

@@ -22,11 +22,20 @@
 
 extern const struct pr_ops nvme_pr_ops;
 
+/* Seconds to jiffies, capped for the u32 timeouts and timer delays */
+static inline unsigned int nvme_timeout_to_jiffies(unsigned int timeout)
+{
+	unsigned long max_secs;
+
+	max_secs = min_t(unsigned long, UINT_MAX, MAX_JIFFY_OFFSET) / HZ;
+	return min_t(unsigned long, timeout, max_secs) * HZ;
+}
+
 extern unsigned int nvme_io_timeout;
-#define NVME_IO_TIMEOUT	(nvme_io_timeout * HZ)
+#define NVME_IO_TIMEOUT	nvme_timeout_to_jiffies(nvme_io_timeout)
 
 extern unsigned int admin_timeout;
-#define NVME_ADMIN_TIMEOUT	(admin_timeout * HZ)
+#define NVME_ADMIN_TIMEOUT	nvme_timeout_to_jiffies(admin_timeout)
 
 #define NVME_DEFAULT_KATO	5
 
@@ -183,6 +192,12 @@ enum nvme_quirks {
 	 * Admin queue DMA buffers must be page aligned
 	 */
 	NVME_QUIRK_ADMIN_PAGE_ALIGN		= (1 << 23),
+
+	/*
+	 * The device is extremely slow on FUA writes but fast on Flush;
+	 * do not advertise FUA so the block layer emulates it.
+	 */
+	NVME_QUIRK_NO_FUA			= (1 << 24),
 };
 
 static inline char *nvme_quirk_name(enum nvme_quirks q)
@@ -236,6 +251,8 @@ static inline char *nvme_quirk_name(enum nvme_quirks q)
 		return "dmapool_align_512";
 	case NVME_QUIRK_ADMIN_PAGE_ALIGN:
 		return "admin_page_align";
+	case NVME_QUIRK_NO_FUA:
+		return "no_fua";
 	}
 
 	return "unknown";
@@ -590,6 +607,7 @@ struct nvme_ns_head {
 #define NVME_NSHEAD_DISK_LIVE		0
 #define NVME_NSHEAD_QUEUE_IF_NO_PATH	1
 #define NVME_NSHEAD_CDEV_LIVE		2
+#define NVME_NSHEAD_FAIL_ON_CTRL_LOSS	3
 	struct nvme_ns __rcu_guarded	*current_path[];
 #endif
 };
@@ -668,6 +686,8 @@ struct nvme_ctrl_ops {
 	int (*get_address)(struct nvme_ctrl *ctrl, char *buf, int size);
 	void (*print_device_info)(struct nvme_ctrl *ctrl);
 	bool (*supports_pci_p2pdma)(struct nvme_ctrl *ctrl);
+	int (*init_dma_buf_io_ctx)(struct nvme_ctrl *ctrl,
+				   struct dma_buf_io_ctx *ctx);
 	unsigned long (*get_virt_boundary)(struct nvme_ctrl *ctrl, bool is_admin);
 };
 
@@ -1096,11 +1116,14 @@ extern struct device_attribute dev_attr_ana_grpid;
 extern struct device_attribute dev_attr_ana_state;
 extern struct device_attribute dev_attr_queue_depth;
 extern struct device_attribute dev_attr_numa_nodes;
+extern struct device_attribute dev_attr_path_state;
 extern struct device_attribute dev_attr_delayed_removal_secs;
+extern struct device_attribute dev_attr_fail_on_ctrl_loss;
 extern struct device_attribute dev_attr_multipath_failover_count;
 extern struct device_attribute dev_attr_io_requeue_no_usable_path_count;
 extern struct device_attribute dev_attr_io_fail_no_available_path_count;
 extern struct device_attribute subsys_attr_iopolicy;
+extern struct device_attribute subsys_attr_iopolicies;
 
 static inline bool nvme_disk_is_ns_head(struct gendisk *disk)
 {

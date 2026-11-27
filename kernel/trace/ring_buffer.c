@@ -642,6 +642,11 @@ static __always_inline unsigned int rb_subbuf_max_data_size(struct trace_buffer 
 	return rb_subbuf_capacity(buffer) - RB_EVNT_HDR_SIZE - sizeof(event->array[0]);
 }
 
+static unsigned long rb_calculate_nr_pages(struct trace_buffer *buffer, unsigned long size)
+{
+	return max(DIV_ROUND_UP(size, rb_subbuf_capacity(buffer)), RING_BUFFER_MIN_NR_PAGES);
+}
+
 /**
  * rb_subbuf_start - Get the start address of a subbuffer
  * @buffer:	A trace buffer
@@ -2463,8 +2468,17 @@ static int __rb_allocate_pages(struct ring_buffer_per_cpu *cpu_buffer,
 		 * memory. It may not be accurate. But we don't care, we just want
 		 * to prevent doing any allocation when it is obvious that it is
 		 * not going to succeed.
+		 *
+		 * With CONFIG_DEFERRED_STRUCT_PAGE_INIT, si_mem_available()
+		 * will reflect the actual available memory only after
+		 * SYSTEM_FREEING_INITMEM.
 		 */
-		i = si_mem_available();
+		if (IS_ENABLED(CONFIG_DEFERRED_STRUCT_PAGE_INIT) &&
+		    unlikely(system_state < SYSTEM_FREEING_INITMEM))
+			i = LONG_MAX;
+		else
+			i = si_mem_available();
+
 		if (i < (nr_pages << subbuf_order))
 			return -ENOMEM;
 
@@ -2868,7 +2882,7 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 			goto fail_free_buffers;
 
 		/* Need at least two pages plus the reader page */
-		if (nr_pages < 3)
+		if (nr_pages < RING_BUFFER_MIN_NR_PAGES + 1)
 			goto fail_free_buffers;
 
  again:
@@ -2880,7 +2894,7 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 			ptr += subbuf_size * nr_pages;
 		}
 		if (ptr > end) {
-			if (nr_pages <= 3)
+			if (nr_pages <= RING_BUFFER_MIN_NR_PAGES + 1)
 				goto fail_free_buffers;
 			nr_pages--;
 			goto again;
@@ -2903,13 +2917,10 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 		if (nr_pages > rb_static_max_pages())
 			goto fail_free_buffers;
 
-		if (nr_pages < 2)
+		if (nr_pages < RING_BUFFER_MIN_NR_PAGES)
 			goto fail_free_buffers;
 	} else {
-		/* need at least two pages */
-		nr_pages = DIV_ROUND_UP(size, rb_subbuf_capacity(buffer));
-		if (nr_pages < 2)
-			nr_pages = 2;
+		nr_pages = rb_calculate_nr_pages(buffer, size);
 	}
 
 	cpumask_set_cpu(cpu, buffer->cpumask);
@@ -3284,6 +3295,21 @@ static void update_pages_handler(struct work_struct *work)
 	complete(&cpu_buffer->update_done);
 }
 
+static bool rb_resize_disabled(struct trace_buffer *buffer, int cpu)
+{
+	lockdep_assert_held(&buffer->mutex);
+
+	if (cpu != RING_BUFFER_ALL_CPUS)
+		return atomic_read(&buffer->buffers[cpu]->resize_disabled);
+
+	for_each_buffer_cpu(buffer, cpu) {
+		if (atomic_read(&buffer->buffers[cpu]->resize_disabled))
+			return true;
+	}
+
+	return false;
+}
+
 /**
  * ring_buffer_resize - resize the ring buffer
  * @buffer: the buffer to resize.
@@ -3322,26 +3348,19 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 	mutex_lock(&buffer->mutex);
 	atomic_inc(&buffer->resizing);
 
-	nr_pages = DIV_ROUND_UP(size, rb_subbuf_capacity(buffer));
+	nr_pages = rb_calculate_nr_pages(buffer, size);
 
-	/* we need a minimum of two pages */
-	if (nr_pages < 2)
-		nr_pages = 2;
+	/*
+	 * Don't succeed if resizing is disabled, as a reader might be
+	 * manipulating the ring buffer and is expecting a sane state while
+	 * this is true.
+	 */
+	if (rb_resize_disabled(buffer, cpu_id)) {
+		err = -EBUSY;
+		goto out_err_unlock;
+	}
 
 	if (cpu_id == RING_BUFFER_ALL_CPUS) {
-		/*
-		 * Don't succeed if resizing is disabled, as a reader might be
-		 * manipulating the ring buffer and is expecting a sane state while
-		 * this is true.
-		 */
-		for_each_buffer_cpu(buffer, cpu) {
-			cpu_buffer = buffer->buffers[cpu];
-			if (atomic_read(&cpu_buffer->resize_disabled)) {
-				err = -EBUSY;
-				goto out_err_unlock;
-			}
-		}
-
 		/* calculate the pages to update */
 		for_each_buffer_cpu(buffer, cpu) {
 			cpu_buffer = buffer->buffers[cpu];
@@ -3412,16 +3431,6 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 
 		if (nr_pages == cpu_buffer->nr_pages)
 			goto out;
-
-		/*
-		 * Don't succeed if resizing is disabled, as a reader might be
-		 * manipulating the ring buffer and is expecting a sane state while
-		 * this is true.
-		 */
-		if (atomic_read(&cpu_buffer->resize_disabled)) {
-			err = -EBUSY;
-			goto out_err_unlock;
-		}
 
 		cpu_buffer->nr_pages_to_update = nr_pages -
 						cpu_buffer->nr_pages;
@@ -5615,14 +5624,12 @@ unsigned long ring_buffer_overruns(struct trace_buffer *buffer)
 }
 EXPORT_SYMBOL_GPL(ring_buffer_overruns);
 
-static bool rb_read_remote_meta_page(struct ring_buffer_per_cpu *cpu_buffer)
+static void rb_read_remote_meta_page(struct ring_buffer_per_cpu *cpu_buffer)
 {
 	local_set(&cpu_buffer->entries, READ_ONCE(cpu_buffer->meta_page->entries));
 	local_set(&cpu_buffer->overrun, READ_ONCE(cpu_buffer->meta_page->overrun));
 	local_set(&cpu_buffer->pages_touched, READ_ONCE(cpu_buffer->meta_page->pages_touched));
 	local_set(&cpu_buffer->pages_lost, READ_ONCE(cpu_buffer->meta_page->pages_lost));
-
-	return rb_num_of_entries(cpu_buffer);
 }
 
 static void rb_update_remote_head(struct ring_buffer_per_cpu *cpu_buffer)
@@ -5825,15 +5832,20 @@ __rb_get_reader_page_from_remote(struct ring_buffer_per_cpu *cpu_buffer)
 {
 	struct buffer_page *new_reader, *prev_reader, *prev_head, *new_head, *last;
 
-	if (!rb_read_remote_meta_page(cpu_buffer))
-		return NULL;
+	rb_read_remote_meta_page(cpu_buffer);
+
+	/*
+	 * Order meta::entries read before page::commit, most likely paired with
+	 * simple_ring_buffer_commit().
+	 */
+	smp_rmb();
 
 	/* More to read on the reader page */
-	if (cpu_buffer->reader_page->read < rb_page_size(cpu_buffer->reader_page)) {
-		if (!cpu_buffer->reader_page->read)
-			cpu_buffer->read_stamp = cpu_buffer->reader_page->page->time_stamp;
-		return cpu_buffer->reader_page;
-	}
+	if (cpu_buffer->reader_page->read < rb_page_size(cpu_buffer->reader_page))
+		goto out;
+
+	if (!rb_num_of_entries(cpu_buffer))
+		return NULL;
 
 	prev_reader = cpu_buffer->subbuf_ids[cpu_buffer->meta_page->reader.id];
 
@@ -5848,7 +5860,8 @@ __rb_get_reader_page_from_remote(struct ring_buffer_per_cpu *cpu_buffer)
 
 	new_reader = cpu_buffer->subbuf_ids[cpu_buffer->meta_page->reader.id];
 
-	WARN_ON_ONCE(prev_reader == new_reader);
+	if (prev_reader == new_reader)
+		return NULL;
 
 	prev_head = new_reader;  /* New reader was also the previous head */
 	new_head = prev_head;
@@ -5876,10 +5889,23 @@ __rb_get_reader_page_from_remote(struct ring_buffer_per_cpu *cpu_buffer)
 	cpu_buffer->reader_page = new_reader;
 	cpu_buffer->reader_page->read = 0;
 	cpu_buffer->pages = &new_head->list;
-	cpu_buffer->read_stamp = new_reader->page->time_stamp;
 	cpu_buffer->lost_events = cpu_buffer->meta_page->reader.lost_events;
+	local_inc(&cpu_buffer->pages_read);
 
-	return rb_page_size(cpu_buffer->reader_page) ? cpu_buffer->reader_page : NULL;
+	if (!rb_page_size(cpu_buffer->reader_page))
+		return NULL;
+
+out:
+	/*
+	 * Order page::commit read before page::data and page::time_stamp, most
+	 * likely paired with simple_ring_buffer_commit().
+	 */
+	smp_rmb();
+
+	if (!cpu_buffer->reader_page->read)
+		cpu_buffer->read_stamp = cpu_buffer->reader_page->page->time_stamp;
+
+	return cpu_buffer->reader_page;
 }
 
 static struct buffer_page *
@@ -6548,18 +6574,23 @@ void ring_buffer_iter_advance(struct ring_buffer_iter *iter)
 EXPORT_SYMBOL_GPL(ring_buffer_iter_advance);
 
 /**
- * ring_buffer_size - return the size of the ring buffer (in bytes)
+ * ring_buffer_capacity - return the capacity of the ring buffer (in bytes)
  * @buffer: The ring buffer.
- * @cpu: The CPU to get ring buffer size from.
+ * @cpu: The CPU to get ring buffer capacity from.
+ *
+ * Capacity is the total memory available for recording event data in the
+ * ring buffer. It excludes subbuffer headers.
+ *
+ * Returns the capacity in bytes, or 0 if the CPU is not set in the buffer mask.
  */
-unsigned long ring_buffer_size(struct trace_buffer *buffer, int cpu)
+unsigned long ring_buffer_capacity(struct trace_buffer *buffer, int cpu)
 {
 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
 		return 0;
 
 	return rb_subbuf_capacity(buffer) * buffer->buffers[cpu]->nr_pages;
 }
-EXPORT_SYMBOL_GPL(ring_buffer_size);
+EXPORT_SYMBOL_GPL(ring_buffer_capacity);
 
 /**
  * ring_buffer_max_event_size - return the max data size of an event
@@ -6903,7 +6934,8 @@ int ring_buffer_poll_remote(struct trace_buffer *buffer, int cpu)
 		cpu_buffer = buffer->buffers[cpu];
 
 		guard(raw_spinlock)(&cpu_buffer->reader_lock);
-		if (rb_read_remote_meta_page(cpu_buffer))
+		rb_read_remote_meta_page(cpu_buffer);
+		if (rb_num_of_entries(cpu_buffer))
 			rb_wakeups(buffer, cpu_buffer);
 
 		return 0;
@@ -7466,6 +7498,8 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 	if (psize > RB_WRITE_MASK + 1)
 		return -EINVAL;
 
+	guard(cpus_read_lock)();
+
 	/* prevent another thread from changing buffer sizes */
 	guard(mutex)(&buffer->mutex);
 
@@ -7475,13 +7509,9 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 
 	old_capacity = rb_subbuf_capacity(buffer);
 
-	/* The mmap fast path reads subbuf_order without buffer->mutex. */
-	for_each_buffer_cpu(buffer, cpu) {
-		if (!cpumask_test_cpu(cpu, buffer->cpumask))
-			continue;
-		if (atomic_read(&buffer->buffers[cpu]->resize_disabled))
-			return -EBUSY;
-	}
+	/* Check it is resizable before we touch subbuf_order */
+	if (rb_resize_disabled(buffer, RING_BUFFER_ALL_CPUS))
+		return -EBUSY;
 
 	atomic_inc(&buffer->record_disabled);
 
@@ -7492,24 +7522,11 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 
 	/* Make sure all new buffers are allocated, before deleting the old ones */
 	for_each_buffer_cpu(buffer, cpu) {
-
-		if (!cpumask_test_cpu(cpu, buffer->cpumask))
-			continue;
-
 		cpu_buffer = buffer->buffers[cpu];
 
-		if (atomic_read(&cpu_buffer->resize_disabled)) {
-			err = -EBUSY;
-			goto error;
-		}
-
 		/* Update the number of pages to match the new size */
-		nr_pages = old_capacity * buffer->buffers[cpu]->nr_pages;
-		nr_pages = DIV_ROUND_UP(nr_pages, rb_subbuf_capacity(buffer));
-
-		/* we need a minimum of two pages */
-		if (nr_pages < 2)
-			nr_pages = 2;
+		nr_pages = rb_calculate_nr_pages(buffer,
+						 old_capacity * buffer->buffers[cpu]->nr_pages);
 
 		cpu_buffer->nr_pages_to_update = nr_pages;
 
@@ -7530,9 +7547,6 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 		struct buffer_data_read_page old_free_data_page;
 		struct list_head old_pages;
 		unsigned long flags;
-
-		if (!cpumask_test_cpu(cpu, buffer->cpumask))
-			continue;
 
 		cpu_buffer = buffer->buffers[cpu];
 
@@ -7879,7 +7893,7 @@ int ring_buffer_map(struct trace_buffer *buffer, int cpu,
 		return err;
 
 	/* subbuf_ids includes the reader while nr_pages does not */
-	subbuf_ids = kcalloc(cpu_buffer->nr_pages + 1, sizeof(*subbuf_ids), GFP_KERNEL);
+	subbuf_ids = kzalloc_objs(*subbuf_ids, cpu_buffer->nr_pages + 1);
 	if (!subbuf_ids) {
 		rb_free_meta_page(cpu_buffer);
 		return -ENOMEM;
@@ -8100,12 +8114,11 @@ int trace_rb_cpu_prepare(unsigned int cpu, struct hlist_node *node)
 	}
 	/* allocate minimum pages, user can later expand it */
 	if (!nr_pages_same)
-		nr_pages = 2;
+		nr_pages = RING_BUFFER_MIN_NR_PAGES;
 	buffer->buffers[cpu] =
 		rb_allocate_cpu_buffer(buffer, nr_pages, cpu);
 	if (!buffer->buffers[cpu]) {
-		WARN(1, "failed to allocate ring buffer on CPU %u\n",
-		     cpu);
+		pr_warn("failed to allocate ring buffer on CPU %u\n", cpu);
 		return -ENOMEM;
 	}
 

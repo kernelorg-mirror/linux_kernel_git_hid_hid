@@ -599,7 +599,10 @@ extern void sched_release_group(struct task_group *tg);
 extern void sched_move_task(struct task_struct *tsk, bool for_autogroup);
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
+extern struct mutex cpu_weight_mutex;
+
 extern int sched_group_set_shares(struct task_group *tg, unsigned long shares);
+extern int sched_group_set_shares_locked(struct task_group *tg, unsigned long shares);
 
 extern int sched_group_set_idle(struct task_group *tg, long idle);
 
@@ -607,6 +610,10 @@ extern void set_task_rq_fair(struct sched_entity *se,
 			     struct cfs_rq *prev, struct cfs_rq *next);
 #else /* !CONFIG_FAIR_GROUP_SCHED: */
 static inline int sched_group_set_shares(struct task_group *tg, unsigned long shares) { return 0; }
+static inline int sched_group_set_shares_locked(struct task_group *tg, unsigned long shares)
+{
+	return 0;
+}
 static inline int sched_group_set_idle(struct task_group *tg, long idle) { return 0; }
 #endif /* !CONFIG_FAIR_GROUP_SCHED */
 
@@ -751,7 +758,7 @@ struct cfs_rq {
 	struct list_head	leaf_cfs_rq_list;
 	struct task_group	*tg;	/* Group that "owns" this runqueue */
 
-	/* Locally cached copy of our task_group's idle value */
+	/* Sum of all ancestor tg->idle. */
 	int			idle;
 
 # ifdef CONFIG_CFS_BANDWIDTH
@@ -781,16 +788,30 @@ struct cfs_rq {
 /* scx_rq->flags, protected by the rq lock */
 enum scx_rq_flags {
 	/*
-	 * A hotplugged CPU starts scheduling before rq_online_scx(). Track
-	 * ops.cpu_on/offline() state so that ops.enqueue/dispatch() are called
-	 * only while the BPF scheduler considers the CPU to be online.
+	 * Set right after the root's ops.cpu_online() when a cpu comes up and
+	 * cleared when the cpu goes down, see handle_hotplug(). A hotplugged
+	 * cpu starts scheduling before %SCX_RQ_ONLINE is set. ops.enqueue() and
+	 * ops.dispatch() are called for the cpu only while the flag is set, see
+	 * scx_rq_online() and scx_dispatch_sched().
 	 */
 	SCX_RQ_ONLINE		= 1 << 0,
 	SCX_RQ_CAN_STOP_TICK	= 1 << 1,
+	/*
+	 * Set while the root considers the cpu online, from its
+	 * ops.cpu_online() until its ops.cpu_offline(). ecaps are delivered
+	 * only while it is set. %SCX_RQ_ONLINE can't gate them, as a cpu going
+	 * down clears it before the ecaps loss is reported, see
+	 * scx_offline_ecaps().
+	 */
+	SCX_RQ_OPS_ONLINE	= 1 << 2,
 	SCX_RQ_CLK_VALID	= 1 << 5, /* RQ clock is fresh and valid */
 	SCX_RQ_BAL_CB_PENDING	= 1 << 6, /* must queue a cb after dispatching */
 	SCX_RQ_SUB_IDLE_RENOTIFY	= 1 << 7, /* sub-scheds are owed update_idle() */
 	SCX_RQ_ROOT_IDLE_RENOTIFY	= 1 << 8, /* the root is owed update_idle() */
+	SCX_RQ_PROXY_RETRY	= 1 << 9, /* proxy-rejected tasks need retry */
+	SCX_RQ_PROXY_TICK	= 1 << 10, /* proxy execution requires the tick */
+	SCX_RQ_PROXY_PENDING	= 1 << 11, /* blocked donor awaits proxy resolution */
+	SCX_RQ_PROXY_BLOCKING	= 1 << 12, /* donor is being removed for sched change */
 
 	SCX_RQ_IN_WAKEUP	= 1 << 16,
 	SCX_RQ_IN_DISPATCH	= 1 << 17,
@@ -803,15 +824,15 @@ struct scx_rq_rescue {
 	u64			clock;			/* last budget accrual timestamp */
 	struct task_struct	*curr;			/* task being rescued, one at a time */
 	s64			slice;			/* curr's admitted slice */
-	u64			exec_snap;		/* sum_exec_runtime at admission */
+	s64			served;			/* curr's served time */
 	struct timer_list	timer;			/* paces admission and escalation */
 	u64			kill_at;		/* last ejection, init before any */
 };
 
 struct scx_rq {
 	struct scx_dispatch_q	local_dsq;
+	struct scx_dispatch_q	reject_dsq;		/* staging for rejected tasks */
 #ifdef CONFIG_EXT_SUB_SCHED
-	struct scx_dispatch_q	reject_dsq;		/* staging for cap-rejected tasks */
 	struct scx_rq_rescue	rescue;
 #endif
 	struct list_head	runnable_list;		/* runnable tasks on this rq */
@@ -830,11 +851,14 @@ struct scx_rq {
 #endif
 	u64			clock;			/* current per-rq clock -- see scx_bpf_now() */
 #ifdef CONFIG_EXT_SUB_SCHED
+	/* sched of the open running session, see scx_cid_sched_update() */
+	struct scx_sched	*sched;
 	struct llist_head	ecaps_to_sync;		/* pending ecaps syncs */
 	struct task_struct	*sub_dispatch_prev;
+	u32			nr_ecaps_offline;	/* marked syncs a down waits for */
 #endif
-	cpumask_var_t		cpus_to_sync;
 	bool			kick_sync_pending;
+	cpumask_var_t		cpus_to_sync;
 	unsigned long		kick_sync;
 
 	struct list_head	sched_pcpus_to_kick;	/* see kick_cpus_irq_workfn() */
@@ -844,8 +868,12 @@ struct scx_rq {
 	struct list_head	deferred_reenq_users;	/* user DSQs requesting reenq */
 	struct balance_callback	deferred_bal_cb;
 	struct balance_callback	kick_sync_bal_cb;
+#ifdef CONFIG_NO_HZ_FULL
+	struct balance_callback	proxy_tick_bal_cb;
+#endif
 	struct irq_work		deferred_irq_work;
 	struct irq_work		kick_cpus_irq_work;
+	struct irq_work		resched_irq_work;
 };
 #endif /* CONFIG_SCHED_CLASS_EXT */
 
@@ -1514,6 +1542,25 @@ static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
 	return &rq->__lock;
 }
 
+/*
+ * A CPU coming online is set in cpu_smt_mask() before
+ * sched_core_cpu_starting() links its rq->core to the core leader.
+ * Until then it does not share the core-wide lock, so it must not be
+ * touched as part of the core.
+ */
+static inline bool sched_core_sibling(struct rq *rq, struct rq *rq_i)
+{
+	return rq_i->core == rq->core;
+}
+
+#define for_each_core_cpu(i, rq) \
+	for_each_cpu(i, cpu_smt_mask(rq->cpu)) \
+		if (sched_core_sibling(rq, cpu_rq(i)))
+
+#define for_each_core_cpu_wrap(i, rq) \
+	for_each_cpu_wrap(i, cpu_smt_mask(rq->cpu), rq->cpu) \
+		if (sched_core_sibling(rq, cpu_rq(i)))
+
 extern bool
 cfs_prio_less(const struct task_struct *a, const struct task_struct *b, bool fi);
 
@@ -2158,7 +2205,8 @@ queue_balance_callback(struct rq *rq,
 	 * balance_push() is active, see the comment with
 	 * balance_push_callback.
 	 */
-	if (unlikely(head->next || rq->balance_callback == &balance_push_callback))
+	if (unlikely(head->next || rq->balance_callback == head ||
+		     rq->balance_callback == &balance_push_callback))
 		return;
 
 	head->func = func;
@@ -3102,11 +3150,6 @@ static inline void __block_task(struct rq *rq, struct task_struct *p)
 {
 	if (p->sched_contributes_to_load)
 		rq->nr_uninterruptible++;
-
-	if (p->in_iowait) {
-		atomic_inc(&rq->nr_iowait);
-		delayacct_blkio_start();
-	}
 
 	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
 
@@ -4273,7 +4316,7 @@ extern void balance_callbacks(struct rq *rq, struct balance_callback *head);
  * Typically this must be called while holding task_rq_lock, since most/all
  * properties are serialized under those locks. There are currently two
  * exceptions to this rule in sched/ext which only hold rq->lock: scx_bypass()
- * and rq_offline_scx().
+ * and drain_offline_rq().
  */
 
 /*
