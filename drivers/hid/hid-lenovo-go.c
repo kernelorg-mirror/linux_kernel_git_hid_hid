@@ -1848,7 +1848,7 @@ static struct go_cfg_attr version_gen_tx_dongle = { HARDWARE_GENERATION };
 LEGO_DEVICE_ATTR_RO(version_gen_tx_dongle, "hardware_generation", TX_DONGLE, version);
 
 static struct go_cfg_attr reset_tx_dongle = { FEATURE_RESET_GAMEPAD };
-LEGO_DEVICE_ATTR_RO(reset_tx_dongle, "reset", TX_DONGLE, feature_status);
+LEGO_DEVICE_ATTR_WO(reset_tx_dongle, "reset", TX_DONGLE, feature_status);
 
 static struct attribute *tx_dongle_attrs[] = {
 	&dev_attr_reset_tx_dongle.attr,
